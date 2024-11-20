@@ -92,6 +92,14 @@ class LoRALinear(nn.Linear):
         if self.r > 0 and not self.merged:
             result = F.linear(x, T(self.weight), bias=self.bias)
             if self.r > 0:
+                # print(x.dtype)
+                # print(self.lora_A.transpose(0, 1).dtype)
+                # lora_A = self.lora_A.to(x.dtype)
+                # # print(self.lora_A.dtype)
+                # # print(self.lora_A.transpose(0, 1).dtype)
+                # lora_B = self.lora_B.to(x.dtype)
+                # scaling = self.scaling.to(x.dtype) if isinstance(self.scaling, torch.Tensor) else self.scaling
+            
                 result += (self.lora_dropout(x) @ self.lora_A.transpose(0, 1) @ self.lora_B.transpose(0, 1)) * self.scaling
             return result
         else:
@@ -100,7 +108,7 @@ class LoRALinear(nn.Linear):
 
 class LoRA:
 
-    def __init__(self, model, r, alpha, float16):
+    def __init__(self, model, r, alpha, float16, bfloat16, pissa):
         """
         Input:
         r, alpha: LoRA hyperparameters
@@ -110,15 +118,24 @@ class LoRA:
         self.model = model
         self.hidden_dim = model.config.hidden_size
         self.float16 = float16
-
+        self.bfloat16 = bfloat16
+        self.pissa = pissa
+        print("model type:", model.config.model_type)
         if model.config.model_type == "opt":
             attention_name = "attn"
+        elif model.config.model_type == ["llama", "qwen2", "phi" ]: 
+            attention_name = "self_attn"
         elif model.config.model_type == "roberta":
+            attention_name = "attention"
+        elif model.config.model_type == "bloom":
             attention_name = "attention"
         else:
             raise NotImplementedError
 
-        # Insert LoRA
+        import safe_open
+        file_path = "/home/u2023040027/models/PiSSA-Llama-2-7b-hf-r128-qv/pissa_init/adapter_model.safetensors"
+        # with safe_open(file_path, framework="pt", device="cpu") as f:
+        #     # Insert LoRA
         for key, _ in model.named_modules():
             if key[-len(attention_name):] == attention_name:
                 logger.info(f"Inject lora to: {key}")
@@ -134,13 +151,161 @@ class LoRA:
                     if float16:
                         attn.q_proj.half()
                         attn.v_proj.half()
+                    if bfloat16:
+                        attn.q_proj.weight = attn.q_proj.weight.to(dtype=torch.bfloat16)
+                        attn.q_proj.bias = attn.q_proj.bias.to(dtype=torch.bfloat16)
                     attn.q_proj.weight.data = original_q_weight 
                     attn.q_proj.bias.data = original_q_bias
                     attn.v_proj.weight.data = original_v_weight
                     attn.v_proj.bias.data = original_v_bias
+                elif model.config.model_type == "llama":
+                    # print("original_q_weight", attn.q_proj.weight.data)
+                    original_q_weight = attn.q_proj.weight.data
+                    # print("original_q_bias", attn.q_proj)
+                    original_q_bias = None
+                    original_v_weight= attn.v_proj.weight.data
+                    original_v_bias = None
+                    attn.q_proj = LoRALinear(model.config.hidden_size, model.config.hidden_size, r=r, lora_alpha=alpha, bias=False).to(original_q_weight.device)
+                    attn.v_proj = LoRALinear(model.config.hidden_size, model.config.hidden_size, r=r, lora_alpha=alpha, bias=False).to(original_v_weight.device)
+                    if float16:
+                        attn.q_proj.half()
+                        attn.v_proj.half()
+                    if bfloat16:
+                        attn.q_proj.weight = nn.Parameter(attn.q_proj.weight.to(dtype=torch.bfloat16))
+                        attn.q_proj.lora_A = nn.Parameter(attn.q_proj.lora_A.to(dtype=torch.bfloat16))
+                        attn.q_proj.lora_B = nn.Parameter(attn.q_proj.lora_B.to(dtype=torch.bfloat16))
+                        # print(f"q_proj weight dtype: {attn.q_proj.weight.dtype}")
+                        # print(f"q_proj lora a weight dtype: {attn.q_proj.lora_A.dtype}")
+                        attn.v_proj.weight = nn.Parameter(attn.v_proj.weight.to(dtype=torch.bfloat16))
+                        attn.v_proj.lora_A = nn.Parameter(attn.v_proj.lora_A.to(dtype=torch.bfloat16))
+                        attn.v_proj.lora_B = nn.Parameter(attn.v_proj.lora_B.to(dtype=torch.bfloat16))
+                        # print(f"v_proj weight dtype: {attn.v_proj.weight.dtype}")
+                    if pissa:
+                        print("pissa")
+                        # attn.q_proj.lora_A = nn.Parameter(f.get_tensor("base_model.model."+key+".q_proj.lora_A.weight"))
+                        # attn.q_proj.lora_B = nn.Parameter(f.get_tensor("base_model.model."+key+".q_proj.lora_B.weight"))
+                    attn.q_proj.weight.data = original_q_weight 
+                    # attn.q_proj.bias.data = original_q_bias
+                    attn.v_proj.weight.data = original_v_weight
+                    # attn.v_proj.bias.data = original_v_bias
+                
+                elif model.config.model_type == "bloom":
+                    # BloomAttention 的 query_key_value 和 dense 层
+                    original_qkv_weight = attn.query_key_value.weight.data
+                    original_dense_weight = attn.dense.weight.data
+
+                    # 替换为 LoRALinear
+                    attn.query_key_value = LoRALinear(1536, 4608, r=r, lora_alpha=alpha, bias=True).to(original_qkv_weight.device)
+                    attn.dense = LoRALinear(1536, 1536, r=r, lora_alpha=alpha, bias=True).to(original_dense_weight.device)
+
+                    if float16:
+                        attn.query_key_value.half()
+                        attn.dense.half()
+                    if bfloat16:
+                        attn.query_key_value.weight = nn.Parameter(attn.query_key_value.weight.to(dtype=torch.bfloat16))
+                        attn.dense.weight = nn.Parameter(attn.dense.weight.to(dtype=torch.bfloat16))
+                    # if pissa:
+                    #     attn.query_key_value.lora_A = nn.Parameter(f.get_tensor("base_model.model." + key + ".query_key_value.lora_A.weight"))
+                    #     attn.query_key_value.lora_B = nn.Parameter(f.get_tensor("base_model.model." + key + ".query_key_value.lora_B.weight"))
+                    attn.query_key_value.weight.data = original_qkv_weight
+                    attn.dense.weight.data = original_dense_weight
+                
+                elif model.config.model_type == "qwen2":
+                    # in early version of transformers, llama attention bias is hard coded to False
+                    attention_bias = False if not hasattr(model.config, "attention_bias") else model.config.attention_bias
+                    original_q_weight = attn.q_proj.weight.data
+                    original_v_weight = attn.v_proj.weight.data
+                    original_q_bias = attn.q_proj.bias.data if attention_bias else None
+                    original_v_bias = attn.v_proj.bias.data if attention_bias else None
+                    head_dim = model.config.hidden_size // model.config.num_attention_heads
+                    attn.q_proj = LoRALinear(
+                        model.config.hidden_size,
+                        model.config.hidden_size,
+                        r=r, lora_alpha=alpha, bias=attention_bias
+                    ).to(original_q_weight.device)
+                    attn.v_proj = LoRALinear(
+                        model.config.hidden_size,
+                        model.config.num_key_value_heads * head_dim,
+                        r=r, lora_alpha=alpha, bias=attention_bias
+                    ).to(original_v_weight.device)
+                    if float16:
+                        attn.q_proj.half()
+                        attn.v_proj.half()
+                    attn.q_proj.weight.data = original_q_weight
+                    attn.v_proj.weight.data = original_v_weight
+                    if attention_bias:
+                        attn.q_proj.bias.data = original_q_bias
+                        attn.v_proj.bias.data = original_v_bias
+                
+
+                elif model.config.model_type == "phi":
+                    config = model.config
+                    attention_bias=True
+                    original_q_weight = attn.q_proj.weight.data
+                    original_v_weight = attn.v_proj.weight.data
+                    original_q_bias = attn.q_proj.bias.data 
+                    original_v_bias = attn.v_proj.bias.data 
+                    attn.q_proj = LoRALinear(
+                        model.config.hidden_size,
+                        model.config.hidden_size,
+                        r=r, lora_alpha=alpha, bias=attention_bias
+                    ).to(original_q_weight.device)
+                    attn.v_proj = LoRALinear(
+                        model.config.hidden_size,
+                        model.config.hidden_size,
+                        r=r, lora_alpha=alpha, bias=attention_bias
+                    ).to(original_v_weight.device)
+                    if float16:
+                        attn.q_proj.half()
+                        attn.v_proj.half()
+                    attn.q_proj.weight.data = original_q_weight
+                    attn.v_proj.weight.data = original_v_weight
+                    if attention_bias:
+                        attn.q_proj.bias.data = original_q_bias
+                        attn.v_proj.bias.data = original_v_bias
+                
                 else:
                     raise NotImplementedError
         
+        # ##pissa
+        # from safetensors import safe_open
+
+        # file_path = "/home/u2023040027/models/PiSSA-Llama-2-7b-hf-r128-qv/pissa_init/adapter_model.safetensors"
+
+        # # 查看模型结构
+        # print(model)
+
+        # # 进一步检查模型的属性
+        # print(model.__dict__.keys())
+
+        # # 查看模型的子模块
+        # for name, module in model.named_modules():
+        #     print(name)
+
+
+        # with safe_open(file_path, framework="pt", device="cpu") as f:
+        #     for key in f.keys():
+        #         # 解析出层编号、投影类型（q_proj/v_proj）和权重类型（lora_A/lora_B）
+        #         # 获取键名列表
+        #         key_parts = key.split('.')
+
+        #         # 寻找 'layers' 关键字的位置，然后提取它后面的数字
+        #         layer_idx = int(key_parts[key_parts.index('layers') + 1])
+
+        #         # 提取投影类型（q_proj/v_proj）和权重类型（lora_A/lora_B）
+        #         proj_type = key_parts[key_parts.index('self_attn') + 1]
+        #         param_type = key_parts[-2]
+
+        #         # 根据解析的键名将权重加载到对应的模型位置
+        #         if param_type == "lora_A":
+        #             model.layers[layer_idx]['self_attn'][proj_type].lora_A.data = f.get_tensor(key)
+        #         elif param_type == "lora_B":
+        #             model.layers[layer_idx]['self_attn'][proj_type].lora_B.data = f.get_tensor(key)
+        # # 验证加载的权重
+        # print(model.layers[0]['self_attn']['q_proj'].lora_A)
+        # print(model.layers[0]['self_attn']['q_proj'].lora_B)
+
+
         # Freeze non-LoRA parameters
         for n, p in model.named_parameters():
             if "lora" not in n:

@@ -24,12 +24,29 @@ def attn_forward_hook(self, *args, **kwargs):
     """
     Replace the original attention forward with this to enable prefix
     """
+    
+    # def _expand_bsz(x, bsz):
+    #     x = x.reshape(x.size(0), self.num_heads, -1).transpose(0,1) # (num_prefix, hidden) -> (num_head, num_prefix, hidden/num_head)
+    #     x = x.unsqueeze(0).expand(bsz, *x.shape) # -> (bsz, num_head, num_prefix, hidden/num_head)
+    #     return x
+
+    #self.original_forward(*args, **kwargs)
 
     def _expand_bsz(x, bsz):
-        x = x.reshape(x.size(0), self.num_heads, -1).transpose(0,1) # (num_prefix, hidden) -> (num_head, num_prefix, hidden/num_head)
-        x = x.unsqueeze(0).expand(bsz, *x.shape) # -> (bsz, num_head, num_prefix, hidden/num_head)
+        # Reshape x to [num_prefix, num_heads, hidden/num_heads]
+        x = x.reshape(x.size(0), self.num_heads, -1)
+        
+        # Transpose to [num_heads, num_prefix, hidden/num_heads]
+        x = x.transpose(0, 1)
+        
+        # Expand to [bsz, num_heads, num_prefix, hidden/num_heads]
+        x = x.unsqueeze(0).expand(bsz, *x.shape)
+        
+        # Merge batch_size and num_heads into a single dimension
+        x = x.reshape(bsz * self.num_heads, x.size(2), x.size(3))  # [bsz * num_heads, num_prefix, hidden/num_heads]
+        
         return x
-    
+
     if "hidden_states" in kwargs:
         hidden_states = kwargs["hidden_states"]
     else:
@@ -42,11 +59,20 @@ def attn_forward_hook(self, *args, **kwargs):
             prefix_values = self.prefix_mlp_values(self.prefix_input_embeds)
         else:
             prefix_keys, prefix_values = self.prefix_keys, self.prefix_values
-        kwargs['past_key_value'] = (_expand_bsz(prefix_keys, bsz), _expand_bsz(prefix_values, bsz))
-    
+
+        #kwargs['past_key_value'] = (_expand_bsz(prefix_keys, bsz), _expand_bsz(prefix_values, bsz))
+        kwargs['layer_past'] = (_expand_bsz(prefix_keys, bsz).transpose(1, 2) , _expand_bsz(prefix_values, bsz))
         if 'attention_mask' in kwargs and kwargs['attention_mask'] is not None:
             am = kwargs['attention_mask']  
-            kwargs['attention_mask'] = torch.cat([-torch.zeros((*am.shape[:-1], self.num_prefix), dtype=am.dtype, device=am.device), am], dim=-1)
+            if am.dtype == torch.bool:
+                # 创建一个与 am 形状相同的布尔零张量
+                zero_tensor = torch.zeros((*am.shape[:-1], self.num_prefix), dtype=am.dtype, device=am.device)
+                
+                # 拼接零张量和 am
+                kwargs['attention_mask'] = torch.cat([zero_tensor, am], dim=-1)
+            else:
+                kwargs['attention_mask'] = torch.cat([-torch.zeros((*am.shape[:-1], self.num_prefix), dtype=am.dtype, device=am.device), am], dim=-1)
+
         elif len(args) > 1: # attention mask is passed via positional argument
             am = args[1]
             am = torch.cat([-torch.zeros((*am.shape[:-1], self.num_prefix), dtype=am.dtype, device=am.device), am], dim=-1)
@@ -121,6 +147,10 @@ class PrefixTuning:
             attention_name = "self_attn"
             first_layer_name = "layers.0"
             layer_name = "layers."
+        elif model.config.model_type == "bloom":
+            attention_name = "self_attention"
+            first_layer_name = "h.0"
+            layer_name = "h."
         else:
             raise NotImplementedError
 
@@ -130,7 +160,7 @@ class PrefixTuning:
 
             # Randomly sample input tokens
             input_tokens = torch.randint(low=0, high=model.config.vocab_size, size=(1, num_prefix), dtype=torch.long).cuda()
-            if model.config.model_type in ["opt", "llama"]:
+            if model.config.model_type in ["opt", "llama", "bloom"]:
                 with torch.no_grad():
                     # Get the real activations
                     real_key_values = model(input_ids=input_tokens, use_cache=True).past_key_values
@@ -171,7 +201,11 @@ class PrefixTuning:
 
 
     def add_prefix(self, module, first, input_embeds=None):
-        device = module.k_proj.weight.data.device
+        model=self.model
+        if model.config.model_type in ["opt", "llama"]:
+            device = module.k_proj.weight.data.device
+        elif model.config.model_type in ["bloom"]:
+            device = module.query_key_value.weight.data.device
         module.num_prefix = self.num_prefix
         module.reparam = self.reparam
         if self.reparam:

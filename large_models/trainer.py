@@ -34,10 +34,12 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Un
 import copy
 from metrics import f1
 import numpy as np
-
+import matplotlib.pyplot as plt
 from tqdm.auto import tqdm
 from transformers import Trainer
 from sklearn.linear_model import LinearRegression, LogisticRegression, LogisticRegressionCV
+# from framework import Framework
+# from tasks import get_task
 
 # Integrations must be imported before ML frameworks:
 from transformers.integrations import (  # isort: split
@@ -64,7 +66,7 @@ from torch.utils.data import DataLoader, Dataset, RandomSampler, SequentialSampl
 from torch.utils.data.distributed import DistributedSampler
 
 from huggingface_hub import Repository
-
+from metrics import calculate_metric
 from transformers import __version__
 from transformers.configuration_utils import PretrainedConfig
 from transformers.data.data_collator import DataCollator, DataCollatorWithPadding, default_data_collator
@@ -209,10 +211,37 @@ OPTIMIZER_NAME = "optimizer.pt"
 SCHEDULER_NAME = "scheduler.pt"
 SCALER_NAME = "scaler.pt"
 
+def get_model_weights_memory(model):
+    total_memory = 0
+    for param in model.parameters():
+        total_memory += param.numel() * param.element_size()
+    return total_memory / (1024 ** 3)  # 转换为 GB
+
+def get_activation_memory():
+    torch.cuda.synchronize()  # 确保同步
+    memory_allocated = torch.cuda.memory_allocated()  # 已分配的显存
+    memory_cached = torch.cuda.memory_reserved()  # 总显存
+    return memory_allocated / (1024 ** 3), memory_cached / (1024 ** 3)  # 转换为 GB
+
+def get_gradients_memory(model):
+    total_memory = 0
+    for param in model.parameters():
+        if param.grad is not None:
+            total_memory += param.grad.numel() * param.grad.element_size()
+    return total_memory / (1024 ** 1)  # 转换为 KB
+
+def get_memory_summary():
+    torch.cuda.synchronize()
+    allocated = torch.cuda.memory_allocated() / (1024 ** 3)
+    cached = torch.cuda.memory_reserved() / (1024 ** 3)
+    return allocated, cached
 
 class OurTrainer(Trainer):
 
     from transformers.trainer_pt_utils import _get_learning_rate, log_metrics, metrics_format, save_metrics, save_state
+    def __init__(self, framework, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.framework = framework  # 将框架实例存储为实例变量
 
     def _inner_training_loop(
         self, batch_size=None, args=None, resume_from_checkpoint=None, trial=None, ignore_keys_for_eval=None
@@ -224,7 +253,7 @@ class OurTrainer(Trainer):
         self._train_batch_size = batch_size
         # Data loader and number of training steps
         train_dataloader = self.get_train_dataloader()
-
+        
         # MeZO added: Linear probing
         if self.args.linear_probing:
 
@@ -463,6 +492,9 @@ class OurTrainer(Trainer):
         model.zero_grad()
 
         self.control = self.callback_handler.on_train_begin(args, self.state, self.control)
+        
+        # 训练开始前
+        logger.info(f"Memory summary (allocated, cached) before epoch: {get_memory_summary()}")
 
         # Skip the first epochs_trained epochs to get the random state of the dataloader at the right point.
         if not args.ignore_data_skip:
@@ -479,6 +511,10 @@ class OurTrainer(Trainer):
                     # Otherwise we need to call the whooooole sampler cause there is some random operation added
                     # AT THE VERY END!
                     _ = list(train_dataloader.sampler)
+
+        self.loss_values = []
+        self.acc_values = []
+        self.epoch_values = []
 
         for epoch in range(epochs_trained, num_train_epochs):
             if isinstance(train_dataloader, DataLoader) and isinstance(train_dataloader.sampler, DistributedSampler):
@@ -538,6 +574,9 @@ class OurTrainer(Trainer):
                             tr_loss_step = self.training_step(model, inputs)
                     else:
                         tr_loss_step = self.training_step(model, inputs)
+                # 查看激活值显存
+                logger.info(f"Activation memory (allocated, cached) during forward pass:{get_activation_memory()}")
+        
 
                 if (
                     args.logging_nan_inf_filter
@@ -593,6 +632,8 @@ class OurTrainer(Trainer):
 
                         # Optimizer step
                         optimizer_was_run = True
+                        # print(self.do_grad_scaling)
+                        # self.do_grad_scaling = True
                         if self.deepspeed:
                             pass  # called outside the loop
                         elif is_torch_tpu_available():
@@ -614,6 +655,9 @@ class OurTrainer(Trainer):
                             self.lr_scheduler.step()
                         model.zero_grad()
 
+                        # 查看梯度显存
+                        logger.info(f"Gradients memory: {get_gradients_memory(model)} MB")
+
                     self.state.global_step += 1
                     self.state.epoch = epoch + (step + 1) / steps_in_epoch
                     self.control = self.callback_handler.on_step_end(args, self.state, self.control)
@@ -624,6 +668,8 @@ class OurTrainer(Trainer):
 
                 if self.control.should_epoch_stop or self.control.should_training_stop:
                     break
+                
+
             if step < 0:
                 logger.warning(
                     "There seems to be not a single sample in your epoch_iterator, stopping training at step"
@@ -634,6 +680,19 @@ class OurTrainer(Trainer):
 
             self.control = self.callback_handler.on_epoch_end(args, self.state, self.control)
             self._maybe_log_save_evaluate(tr_loss, model, trial, epoch, ignore_keys_for_eval)
+            logger.info(f"tr_loss:{tr_loss}")
+            logger.info(f"self.state.global_step: {self.state.global_step}")
+            logger.info(f"epoch: {epoch}")
+            
+            self.epoch_values.append(epoch)
+            self.loss_values.append(tr_loss.item())
+
+            if args.num_eval is not None:
+                eval_samples = self.framework.task.sample_subset(data_split="valid", seed=self.framework.args.train_set_seed , num=args.num_eval)
+            else:
+                eval_samples = self.framework.task.valid_samples
+            metrics=self.framework.evaluate([], eval_samples) 
+            self.acc_values.append(metrics['accuracy'])
 
             if DebugOption.TPU_METRICS_DEBUG in self.args.debug:
                 if is_torch_tpu_available():
@@ -646,6 +705,18 @@ class OurTrainer(Trainer):
                     )
             if self.control.should_training_stop:
                 break
+             
+            # self.eval_dataset
+            # # Sample eval samples
+            # if self.args.num_eval is not None:
+            #     eval_samples = task.sample_subset(data_split="valid", seed=self.args.train_set_seed, num=args.num_eval)
+            # else:
+            #     eval_samples = task.valid_samples
+            # metrics = framework_train.evaluate([], eval_samples) 
+        if not (self.loss_values==[]):
+            self.plot_and_save_loss_curve()
+        if not (self.acc_values==[]):
+            self.plot_and_save_acc_curve()
 
         if args.past_index and hasattr(self, "_past"):
             # Clean the state at the end of training
@@ -682,7 +753,7 @@ class OurTrainer(Trainer):
         checkpoints_sorted = self._sorted_checkpoints(use_mtime=False, output_dir=run_dir)
 
         # Delete the last checkpoint when save_total_limit=1 if it's different from the best checkpoint.
-        if self.state.best_model_checkpoint is not None and self.args.save_total_limit == 1:
+        if self.state.best_model_checkpoint is not None and self.args.save_total_limit == 4:
             for checkpoint in checkpoints_sorted:
                 if checkpoint != self.state.best_model_checkpoint:
                     logger.info(f"Deleting older checkpoint [{checkpoint}] due to args.save_total_limit")
@@ -772,20 +843,104 @@ class OurTrainer(Trainer):
         # First function evaluation
         self.zo_perturb_parameters(scaling_factor=1)
         loss1 = self.zo_forward(model, inputs)
+        logger.info(f"loss1: {loss1}")
 
         # Second function evaluation
         self.zo_perturb_parameters(scaling_factor=-2)
         loss2 = self.zo_forward(model, inputs)
+        print("loss2:", loss2)
+        logger.info(f"loss2: {loss2}")
 
         self.projected_grad = ((loss1 - loss2) / (2 * self.args.zo_eps)).item()
+        zo_clip_grad = 5
+        self.projected_grad = max(min(self.projected_grad, zo_clip_grad), -zo_clip_grad)
+        print("projected_grad:", self.projected_grad)
 
         # No gradient accumulation support
         assert self.args.gradient_accumulation_steps == 1
 
         # Reset model back to its parameters at start of step
         self.zo_perturb_parameters(scaling_factor=1)
-        
+
         return loss1
+
+    # def fw_step(self, model, inputs):
+    #     """
+    #     Estimate gradient by MeZO. Return the loss from f(theta + z)
+    #     """
+    #     args = self.args
+
+    #     # What parameters to optimize 
+    #     self.named_parameters_to_optim = []
+    #     for name, param in model.named_parameters():
+    #         if param.requires_grad:
+    #             self.named_parameters_to_optim.append((name, param))
+
+    #     # Sample the random seed for sampling z
+    #     self.zo_random_seed = np.random.randint(1000000000)
+
+    #     # First function evaluation
+    #     self.zo_perturb_parameters(scaling_factor=1)
+    #     loss1 = self.zo_forward(model, inputs)
+    #     print("loss1:", loss1)
+
+    #     # Second function evaluation
+    #     self.zo_perturb_parameters(scaling_factor=-2)
+    #     loss2 = self.zo_forward(model, inputs)
+    #     print("loss2:", loss2)
+
+    #     self.projected_grad = ((loss1 - loss2) / (2 * self.args.zo_eps)).item()
+    #     zo_clip_grad = 5
+    #     self.projected_grad = max(min(self.projected_grad, zo_clip_grad), -zo_clip_grad)
+    #     print("projected_grad:", self.projected_grad)
+
+    #     # No gradient accumulation support
+    #     assert self.args.gradient_accumulation_steps == 1
+
+    #     # Reset model back to its parameters at start of step
+    #     self.zo_perturb_parameters(scaling_factor=1)
+        
+    #     return loss1
+
+    #     def calculate_jvp(func, params, v):
+    #      """
+    #      Calculations Jacobian-vector product using numerical differentiation
+    #      """
+    #         h = 0.01
+    #         with autocast():
+    #             loss = func(tuple([params[i]-h*v[i] for i in range(len(params))]))
+    #             terbulence_loss = func(tuple([params[i]+h*v[i] for i in range(len(params))]))
+    #         avg_loss = (terbulence_loss + loss)/2
+    #         jvp = (terbulence_loss - loss)/(2*h)
+    #         return avg_loss, jvp
+
+    #     # 优化函数
+    #     f = partial(
+    #         functional_get_loss,
+    #         model=self.fmodel,
+    #         buffers = self.buffers,
+    #         num_classes = self.num_labels,
+    #         x=x,
+    #         t=labels,
+    #     )
+
+    #     # 生成扰动
+    #     if self.args.perturbation_sampling and v_buffer != {}:
+    #         v_params = tuple([v_buffer[i][batch_idx].to(device) if p.requires_grad == True else torch.zeros_like(p) for i,p in enumerate(self.params)])
+    #     else:
+    #         v_params = tuple([torch.randn_like(p) if p.requires_grad == True else torch.zeros_like(p) for p in self.params])
+                    
+    #     # 计算方向导数
+    #     loss, jvp = calculate_jvp(f, self.params, v_params)
+                    
+    #     # 计算梯度
+    #     for j, fg in enumerate(self.grad):
+    #         fg.add_(jvp*v_params[j])
+    #         if self.args.var_control and j == self.layer_id_for_check:
+    #             self.grad_for_var_check_list.append(jvp*v_params[j])
+
+
+    #     current_loss = loss.item()
 
 
     def zo_update(self, model):
@@ -891,3 +1046,60 @@ class OurTrainer(Trainer):
         # Push to the Hub when `save_model` is called by the user.
         if self.args.push_to_hub and not _internal_call:
             self.push_to_hub(commit_message="Model save")
+    
+
+    def plot_and_save_loss_curve(self, save_path="convergence_curve.jpg"):
+        """
+        绘制并保存损失值的收敛曲线
+        :param losses: 损失值列表
+        :param save_path: 保存图片的路径
+        """
+        if save_path is not None:
+            save_path = self.args.curve_path.replace(".jpg", "-loss.jpg")
+        save_dir = os.path.dirname(save_path)
+        if save_dir != "" and not os.path.exists(save_dir):
+            os.makedirs(save_dir)
+
+
+        plt.figure(figsize=(10, 6))
+        loss=np.array(self.loss_values)
+        plt.plot(self.epoch_values, loss, label="Training Loss")
+        plt.title("Convergence Curve")
+        plt.xlabel("Epoch")
+        plt.ylabel("Loss")
+        plt.grid(True)
+        plt.legend()
+        
+        # 保存图像
+        plt.savefig(save_path)
+        print(f"Convergence curve saved to {save_path}")
+        plt.close()
+    
+    def plot_and_save_acc_curve(self, save_path="convergence_curve.jpg"):
+        """
+        绘制并保存损失值的收敛曲线
+        :param losses: 损失值列表
+        :param save_path: 保存图片的路径
+        """
+        if save_path is not None:
+            save_path = self.args.curve_path.replace(".jpg", "-acc.jpg")
+        save_dir = os.path.dirname(save_path)
+        if save_dir != "" and not os.path.exists(save_dir):
+            os.makedirs(save_dir)
+
+        plt.figure(figsize=(10, 6))
+        plt.plot(self.epoch_values, self.acc_values, label="Acc")
+        plt.title("Accuracy Curve")
+        plt.xlabel("Epoch")
+        plt.ylabel("Acc")
+        plt.grid(True)
+        plt.legend()
+        
+        # 保存图像
+        plt.savefig(save_path)
+        print(f"Convergence curve saved to {save_path}")
+        plt.close()
+
+    
+    
+    

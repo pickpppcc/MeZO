@@ -60,14 +60,15 @@ echo "SEED: $SEED"
 echo "MODE: $MODE"
 echo "Extra args: $EXTRA_ARGS $TASK_ARGS"
 
-python run.py \
+python run_train.py \
     --model_name $MODEL \
     --task_name $TASK \
-    --output_dir result/$TASK-${MODEL_NAME}-$TAG --tag $TAG --train_set_seed $SEED --num_train $TRAIN --num_dev $DEV --num_eval $EVAL --logging_steps 10 \
+    --output_dir results/$TASK-${MODEL_NAME}-$TAG --tag $TAG --train_set_seed $SEED --num_train $TRAIN --num_dev $DEV --num_eval $EVAL --logging_steps 10 \
     --trainer regular --fp16 \
+    --curve_path curves/$TASK-${MODEL_NAME}-$TAG.png  \
     --learning_rate $LR --num_train_epochs $EPOCH --per_device_train_batch_size $BS \
     --load_best_model_at_end --evaluation_strategy epoch --save_strategy epoch --save_total_limit 1 \
     --train_as_classification \
     $EXTRA_ARGS \
     $TASK_ARGS \
-    "$@"
+    "$@" &> "log_curves/$TASK-${MODEL_NAME}-$TAG.log"

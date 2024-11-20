@@ -332,7 +332,7 @@ class RTEDataset(Dataset):
         self.load_dataset(subtask, **kwargs)
     
     def load_dataset(self, path, **kwargs):
-        d = load_dataset("super_glue", "rte")
+        d = load_dataset("super_glue", "rte", trust_remote_code=True)
         train_set = d["train"]
         valid_set = d["validation"]
 
