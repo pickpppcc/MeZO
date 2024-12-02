@@ -43,18 +43,17 @@ from sklearn.linear_model import LinearRegression, LogisticRegression, LogisticR
 
 # Integrations must be imported before ML frameworks:
 from transformers.integrations import (  # isort: split
-    default_hp_search_backend,
     get_reporting_integration_callbacks,
     hp_params,
-    is_fairscale_available,
-    is_optuna_available,
-    is_ray_tune_available,
-    is_sigopt_available,
-    is_wandb_available,
-    run_hp_search_optuna,
-    run_hp_search_ray,
-    run_hp_search_sigopt,
-    run_hp_search_wandb,
+    # is_fairscale_available,
+    # is_optuna_available,
+    # is_ray_tune_available,
+    # is_sigopt_available,
+    # is_wandb_available,
+    # run_hp_search_optuna,
+    # run_hp_search_ray,
+    # run_hp_search_sigopt,
+    # run_hp_search_wandb,
 )
 
 import numpy as np
@@ -77,7 +76,7 @@ from transformers.modelcard import TrainingSummary
 from transformers.modeling_utils import PreTrainedModel, load_sharded_checkpoint, unwrap_model
 from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES, MODEL_MAPPING_NAMES
 from transformers.optimization import Adafactor, get_scheduler
-from transformers.pytorch_utils import ALL_LAYERNORM_LAYERS, is_torch_greater_or_equal_than_1_10, is_torch_less_than_1_11
+from transformers.pytorch_utils import ALL_LAYERNORM_LAYERS
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 from transformers.trainer_callback import (
     CallbackHandler,
@@ -120,19 +119,19 @@ from transformers.trainer_utils import (
     IntervalStrategy,
     PredictionOutput,
     RemoveColumnsCollator,
-    ShardedDDPOption,
+    # ShardedDDPOption,
     TrainerMemoryTracker,
     TrainOutput,
     default_compute_objective,
-    default_hp_space,
-    denumpify_detensorize,
-    enable_full_determinism,
-    find_executable_batch_size,
-    get_last_checkpoint,
+    # default_hp_space,
+    # denumpify_detensorize,
+    # enable_full_determinism,
+    # find_executable_batch_size,
+    # get_last_checkpoint,
     has_length,
-    number_of_arguments,
-    seed_worker,
-    set_seed,
+    # number_of_arguments,
+    # seed_worker,
+    # set_seed,
     speed_metrics,
 )
 from transformers.training_args import OptimizerNames, ParallelMode, TrainingArguments
@@ -156,7 +155,7 @@ from transformers.utils import (
 from transformers.utils.generic import ContextManagers
 
 
-_is_native_cpu_amp_available = is_torch_greater_or_equal_than_1_10
+# _is_native_cpu_amp_available = is_torch_greater_or_equal_than_1_10
 
 DEFAULT_CALLBACKS = [DefaultFlowCallback]
 DEFAULT_PROGRESS_CALLBACK = ProgressCallback
@@ -177,14 +176,14 @@ if is_torch_tpu_available(check_device=False):
     import torch_xla.debug.metrics as met
     import torch_xla.distributed.parallel_loader as pl
 
-if is_fairscale_available():
-    dep_version_check("fairscale")
-    import fairscale
-    from fairscale.nn.data_parallel import FullyShardedDataParallel as FullyShardedDDP
-    from fairscale.nn.data_parallel import ShardedDataParallel as ShardedDDP
-    from fairscale.nn.wrap import auto_wrap
-    from fairscale.optim import OSS
-    from fairscale.optim.grad_scaler import ShardedGradScaler
+# if is_fairscale_available():
+#     dep_version_check("fairscale")
+#     import fairscale
+#     from fairscale.nn.data_parallel import FullyShardedDataParallel as FullyShardedDDP
+#     from fairscale.nn.data_parallel import ShardedDataParallel as ShardedDDP
+#     from fairscale.nn.wrap import auto_wrap
+#     from fairscale.optim import OSS
+#     from fairscale.optim.grad_scaler import ShardedGradScaler
 
 
 if is_sagemaker_mp_enabled():
@@ -377,10 +376,10 @@ class OurTrainer(Trainer):
                 debug_overflow = DebugUnderflowOverflow(self.model)  # noqa
 
         delay_optimizer_creation = (
-            self.sharded_ddp is not None
-            and self.sharded_ddp != ShardedDDPOption.SIMPLE
-            or is_sagemaker_mp_enabled()
-            or self.fsdp is not None
+            # self.sharded_ddp is not None
+            # and self.sharded_ddp != ShardedDDPOption.SIMPLE
+            is_sagemaker_mp_enabled()
+            # or self.fsdp is not None
         )
         if args.deepspeed:
             deepspeed_engine, optimizer, lr_scheduler = deepspeed_init(
@@ -502,15 +501,15 @@ class OurTrainer(Trainer):
                 is_random_sampler = hasattr(train_dataloader, "sampler") and isinstance(
                     train_dataloader.sampler, RandomSampler
                 )
-                if is_torch_less_than_1_11 or not is_random_sampler:
-                    # We just need to begin an iteration to create the randomization of the sampler.
-                    # That was before PyTorch 1.11 however...
-                    for _ in train_dataloader:
-                        break
-                else:
-                    # Otherwise we need to call the whooooole sampler cause there is some random operation added
-                    # AT THE VERY END!
-                    _ = list(train_dataloader.sampler)
+                # if is_torch_less_than_1_11 or not is_random_sampler:
+                #     # We just need to begin an iteration to create the randomization of the sampler.
+                #     # That was before PyTorch 1.11 however...
+                #     for _ in train_dataloader:
+                #         break
+                # else:
+                #     # Otherwise we need to call the whooooole sampler cause there is some random operation added
+                #     # AT THE VERY END!
+                _ = list(train_dataloader.sampler)
 
         self.loss_values = []
         self.acc_values = []
@@ -607,13 +606,13 @@ class OurTrainer(Trainer):
                         if args.max_grad_norm is not None and args.max_grad_norm > 0 and not self.deepspeed:
                             # deepspeed does its own clipping
 
-                            if self.do_grad_scaling:
-                                # Reduce gradients first for XLA
-                                if is_torch_tpu_available():
-                                    gradients = xm._fetch_gradients(self.optimizer)
-                                    xm.all_reduce("sum", gradients, scale=1.0 / xm.xrt_world_size())
-                                # AMP: gradients need unscaling
-                                self.scaler.unscale_(self.optimizer)
+                            # if self.do_grad_scaling:
+                            # Reduce gradients first for XLA
+                            # if is_torch_tpu_available():
+                            #     gradients = xm._fetch_gradients(self.optimizer)
+                            #     xm.all_reduce("sum", gradients, scale=1.0 / xm.xrt_world_size())
+                            # # AMP: gradients need unscaling
+                            # self.scaler.unscale_(self.optimizer)
 
                             if is_sagemaker_mp_enabled() and args.fp16:
                                 self.optimizer.clip_master_grads(args.max_grad_norm)
@@ -642,12 +641,12 @@ class OurTrainer(Trainer):
                                 self.scaler.update()
                             else:
                                 xm.optimizer_step(self.optimizer)
-                        elif self.do_grad_scaling:
-                            scale_before = self.scaler.get_scale()
-                            self.scaler.step(self.optimizer)
-                            self.scaler.update()
-                            scale_after = self.scaler.get_scale()
-                            optimizer_was_run = scale_before <= scale_after
+                        # elif self.do_grad_scaling:
+                            # scale_before = self.scaler.get_scale()
+                            # self.scaler.step(self.optimizer)
+                            # self.scaler.update()
+                            # scale_after = self.scaler.get_scale()
+                            # optimizer_was_run = scale_before <= scale_after
                         else:
                             self.optimizer.step()
 
@@ -662,7 +661,7 @@ class OurTrainer(Trainer):
                     self.state.epoch = epoch + (step + 1) / steps_in_epoch
                     self.control = self.callback_handler.on_step_end(args, self.state, self.control)
 
-                    self._maybe_log_save_evaluate(tr_loss, model, trial, epoch, ignore_keys_for_eval)
+                    # self._maybe_log_save_evaluate(tr_loss, model, trial, epoch, ignore_keys_for_eval)
                 else:
                     self.control = self.callback_handler.on_substep_end(args, self.state, self.control)
 
@@ -679,13 +678,13 @@ class OurTrainer(Trainer):
                 self.control.should_training_stop = True
 
             self.control = self.callback_handler.on_epoch_end(args, self.state, self.control)
-            self._maybe_log_save_evaluate(tr_loss, model, trial, epoch, ignore_keys_for_eval)
-            logger.info(f"tr_loss:{tr_loss}")
-            logger.info(f"self.state.global_step: {self.state.global_step}")
-            logger.info(f"epoch: {epoch}")
+            # self._maybe_log_save_evaluate(tr_loss, model, trial, epoch, ignore_keys_for_eval)
+            # logger.info(f"tr_loss:{tr_loss}")
+            # logger.info(f"self.state.global_step: {self.state.global_step}")
+            # logger.info(f"epoch: {epoch}")
             
             self.epoch_values.append(epoch)
-            self.loss_values.append(tr_loss.item())
+            self.loss_values.append(tr_loss_step.item())
 
             if args.num_eval is not None:
                 eval_samples = self.framework.task.sample_subset(data_split="valid", seed=self.framework.args.train_set_seed , num=args.num_eval)
@@ -693,6 +692,11 @@ class OurTrainer(Trainer):
                 eval_samples = self.framework.task.valid_samples
             metrics=self.framework.evaluate([], eval_samples) 
             self.acc_values.append(metrics['accuracy'])
+
+            logger.info(f"tr_loss:{tr_loss_step}")
+            logger.info(f"acc: {metrics['accuracy']}")
+            logger.info(f"self.state.global_step: {self.state.global_step}")
+            logger.info(f"epoch: {epoch}")
 
             if DebugOption.TPU_METRICS_DEBUG in self.args.debug:
                 if is_torch_tpu_available():
@@ -999,9 +1003,9 @@ class OurTrainer(Trainer):
                 # 'user_content.pt' indicates model state_dict saved with smp >= 1.10
                 Path(os.path.join(output_dir, "user_content.pt")).touch()
         elif (
-            ShardedDDPOption.ZERO_DP_2 in self.args.sharded_ddp
-            or ShardedDDPOption.ZERO_DP_3 in self.args.sharded_ddp
-            or self.fsdp is not None
+            # ShardedDDPOption.ZERO_DP_2 in self.args.sharded_ddp
+            # or ShardedDDPOption.ZERO_DP_3 in self.args.sharded_ddp
+            self.fsdp is not None
         ):
             from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, StateDictType, FullStateDictConfig
             full_state_dict_config = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)

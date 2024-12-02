@@ -17,7 +17,10 @@ if [ "$MODE" == "prefix" ]; then
 elif [ "$MODE" == "lora" ]; then
     EXTRA_ARGS="--lora"
 fi
-TAG=$MODE-$EPOCH-$BS-$LR-$SEED
+if [ "$BF" == "fp16" ]; then
+    BF_ARGS="--load_float16"
+fi
+TAG=$MODE-$BF-$EPOCH-$BS-$LR-$SEED
 
 TASK_ARGS=""
 case $TASK in
@@ -60,15 +63,23 @@ echo "SEED: $SEED"
 echo "MODE: $MODE"
 echo "Extra args: $EXTRA_ARGS $TASK_ARGS"
 
-python run_train.py \
-    --model_name $MODEL \
-    --task_name $TASK \
-    --output_dir results/$TASK-${MODEL_NAME}-$TAG --tag $TAG --train_set_seed $SEED --num_train $TRAIN --num_dev $DEV --num_eval $EVAL --logging_steps 10 \
-    --trainer regular --fp16 \
-    --curve_path curves/$TASK-${MODEL_NAME}-$TAG.png  \
-    --learning_rate $LR --num_train_epochs $EPOCH --per_device_train_batch_size $BS \
-    --load_best_model_at_end --evaluation_strategy epoch --save_strategy epoch --save_total_limit 1 \
-    --train_as_classification \
-    $EXTRA_ARGS \
-    $TASK_ARGS \
-    "$@" &> "log_curves/$TASK-${MODEL_NAME}-$TAG.log"
+mkdir -p "log/$MODEL_NAME" "curves/$MODEL_NAME"
+
+if [ -f "curves/$MODEL_NAME/$TASK-$TAG-acc.jpg" ]; then
+    echo "Curve file curves/$MODEL_NAME/$TASK-$TAG.jpg already exists. Skipping..."
+else
+    echo "Running task: $TASK"
+    python run_train.py \
+        --model_name $MODEL \
+        --task_name $TASK \
+        --output_dir results/$MODEL_NAME/$TASK-$TAG --tag $TAG --train_set_seed $SEED --num_train $TRAIN --num_dev $DEV --num_eval $EVAL --logging_steps 10 \
+        --trainer regular --fp16 \
+        --curve_path curves/$MODEL_NAME/$TASK-$TAG.jpg  \
+        --learning_rate $LR --num_train_epochs $EPOCH --per_device_train_batch_size $BS \
+        --load_best_model_at_end --evaluation_strategy epoch --save_strategy epoch --save_total_limit 1 \
+        --train_as_classification \
+        $EXTRA_ARGS \
+        $TASK_ARGS \
+        $BF_ARGS \
+        "$@" &> "log/$MODEL_NAME/$TASK-$TAG.log"
+fi

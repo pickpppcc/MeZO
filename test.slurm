@@ -27,5 +27,5 @@ export HF_ENDPOINT=https://hf-mirror.com
 
 #MODEL=/home/u2024140809/share/opt-1.3B TASK=SST2 MODE=lora LR=5e-5 EPS=1e-2  BF=fp16  bash mezo.sh 
 # MODEL=/home/u2024140809/share/Qwen:Qwen2.5-0.5B TASK=SST2 MODE=lora LR=5e-5 EPS=1e-2  BF=fp16  bash mezo.sh 
-
-MODEL=/home/u2024140809/share/phi-1 TASK=SST2 MODE=lora LR=5e-5 EPS=1e-2  BF=fp16  bash mezo.sh 
+#MODEL=/home/u2024140809/share/phi-1 TASK=SST2 MODE=lora LR=5e-5 EPS=1e-2  BF=fp16  bash mezo.sh 
+MODEL=/data/pc/models/Llama-3.2-1B TASK=SST2 MODE=lora LR=5e-5 EPS=1e-2  BF=fp16  bash mezo.sh 
