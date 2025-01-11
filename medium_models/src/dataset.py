@@ -114,6 +114,12 @@ def tokenize_multipart_input(
                 if (part == 'cls' or part == 'bos') and ('T5' in type(tokenizer).__name__ or tokenizer.model_type == "gpt2"):
                     # T5 or GPT-2 do not have cls token
                     continue
+                if (part == 'cls' or part == 'mask' or  part == 'sep' or  part == 'sep+') and (tokenizer.model_type == "llama" or tokenizer.model_type == "qwen2"):
+                    # llama do not have cls token
+                    continue
+                if (part == 'cls' or part == 'mask' ) and (tokenizer.model_type == "opt" ):
+                    # llama do not have cls token
+                    continue
                 new_tokens.append(special_token_mapping[part])
                 if part == 'sep+':
                     segment_plus_1_flag = True
@@ -334,7 +340,7 @@ class FewShotDataset(torch.utils.data.Dataset):
         # Load cache
         # Cache name distinguishes mode, task name, tokenizer, and length. So if you change anything beyond these elements, make sure to clear your cache.
         cached_features_file = os.path.join(
-            cache_dir if cache_dir is not None else args.data_dir,
+            cache_dir if cache_dir is not None else args.data_dir+"/test",
             "cached_{}_{}_{}_{}".format(
                 mode,
                 tokenizer.__class__.__name__ + "-" + tokenizer.model_type,
@@ -360,12 +366,25 @@ class FewShotDataset(torch.utils.data.Dataset):
                 # The support examples are sourced from the training set.
                 self.support_examples = self.processor.get_train_examples(args.data_dir)
 
-                if mode == "dev":
-                    self.query_examples = self.processor.get_dev_examples(args.data_dir)
-                elif mode == "test":
-                    self.query_examples = self.processor.get_test_examples(args.data_dir)
+                if not self.support_examples:
+                    logger.warning("No support examples found. Proceeding with zero-shot setup.")
+                    # 如果没有 support_examples，确保 query_examples 可以正常加载
+                    if mode == "train":
+                        self.query_examples = []
+                    elif mode == "dev":
+                        self.query_examples = self.processor.get_dev_examples(args.data_dir)
+                    elif mode == "test":
+                        self.query_examples = self.processor.get_test_examples(args.data_dir)
                 else:
-                    self.query_examples = self.support_examples
+                    logger.info(f"Loaded {len(self.support_examples)} support examples.")
+                    if mode == "dev":
+                        self.query_examples = self.processor.get_dev_examples(args.data_dir)
+                    elif mode == "test":
+                        self.query_examples = self.processor.get_test_examples(args.data_dir)
+                    else:
+                        self.query_examples = self.support_examples
+
+                logger.info(f"Loaded {len(self.query_examples)} query examples.")
 
                 start = time.time()
                 torch.save([self.support_examples, self.query_examples], cached_features_file)
@@ -489,39 +508,41 @@ class FewShotDataset(torch.utils.data.Dataset):
         else:
             self.features = None
 
-    def select_context(self, context_examples):
-        """
-        Select demonstrations from provided examples.
-        """
+    def select_context(self, examples):
+        # 添加对空样本的处理
+        if not examples:
+            return []  # 或者返回一个默认的上下文
+        
+        selection = []
         max_demo_per_label = 1
         counts = {k: 0 for k in self.label_list}
         if len(self.label_list) == 1:
             # Regression
             counts = {'0': 0, '1': 0}
-        selection = []
-
         if self.args.gpt3_in_context_head or self.args.gpt3_in_context_tail:
             # For GPT-3's in-context learning, we sample gpt3_in_context_num demonstrations randomly.
-            order = np.random.permutation(len(context_examples))
+            order = np.random.permutation(len(examples))
             for i in range(min(self.args.gpt3_in_context_num, len(order))):
-                selection.append(context_examples[order[i]])
+                selection.append(examples[order[i]])
         else:
             # Our sampling strategy
-            order = np.random.permutation(len(context_examples))
+            order = np.random.permutation(len(examples))
 
             for i in order:
-                label = context_examples[i].label
+                label = examples[i].label
                 if len(self.label_list) == 1:
                     # Regression
                     label = '0' if float(label) <= median_mapping[self.args.task_name] else '1'
                 if counts[label] < max_demo_per_label:
-                    selection.append(context_examples[i])
+                    selection.append(examples[i])
                     counts[label] += 1
                 if sum(counts.values()) == len(counts) * max_demo_per_label:
                     break
 
-            assert len(selection) > 0
-
+        if len(selection) == 0:
+            logger.warning("No context examples were selected")
+            return []  # 或者返回一个默认值
+        
         return selection
 
     def __len__(self):

@@ -1,6 +1,6 @@
 import logging
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "5"  
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"  
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -109,6 +109,16 @@ class OurArguments(TrainingArguments):
 
     # Auto saving when interrupted
     save_on_interrupt: bool = False # save model when interrupted (useful for long training)
+
+    # bf16 training parameters
+    bf16: bool = field(
+        default=True,
+        metadata={"help": "Whether to use bf16 (mixed) precision instead of 32-bit"}
+    )
+    bf16_full_eval: bool = field(
+        default=True,
+        metadata={"help": "Whether to use full bf16 evaluation instead of 32-bit"}
+    )
 
 
 def parse_args():

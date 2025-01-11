@@ -3,6 +3,8 @@
 import dataclasses
 import logging
 import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "4,5"  
+os.environ["WANDB_MODE"] = "offline"
 import sys
 from dataclasses import dataclass, field
 from typing import Callable, Dict, Optional, Union, List
@@ -13,7 +15,10 @@ import numpy as np
 
 from transformers import AutoConfig, AutoModelForSequenceClassification, AutoTokenizer, EvalPrediction, PreTrainedTokenizerBase
 from src.modeling_roberta import RobertaConfig
+from transformers.models.llama.configuration_llama import LlamaConfig
 from src.modeling_opt import OPTConfig
+from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
+
 from transformers import GlueDataTrainingArguments as DataTrainingArguments
 from transformers import HfArgumentParser, TrainingArguments, set_seed
 
@@ -25,6 +30,7 @@ from src.processors import processors_mapping, num_labels_mapping, output_modes_
 
 from filelock import FileLock
 from datetime import datetime
+
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -94,6 +100,7 @@ class ModelArguments:
         default=False,
         metadata={"help": "Use in-context learning demos in sfc."}
     )
+
 
 
 @dataclass
@@ -260,12 +267,17 @@ class DynamicDataTrainingArguments(DataTrainingArguments):
 
 @dataclass
 class DynamicTrainingArguments(TrainingArguments):
+    
+
+    curve_path: str = field(default=f"curves/acc.jpg", metadata={"help": "Path to save convergence curve image"}) 
+
     evaluate_during_training: bool = field(
-        default=False,
+        default=True,
         metadata={"help": "Whether to run evaluation during training or at the."}
     )
     log_file: str = field(
-        default='log'
+        default='log/log.txt',
+        metadata={"help": "Path to the log file"}
     )
 
     # For ensemble
@@ -529,6 +541,17 @@ class DynamicTrainingArguments(TrainingArguments):
         metadata={"help": "Tune the head only"}
     )
 
+    # 继承自TrainingArguments的fp16参数,但增加bf16支持
+    fp16: bool = field(
+        default=False,
+        metadata={"help": "Whether to use fp16 16-bit (mixed) precision training instead of 32-bit training."}
+    )
+    
+    bf16: bool = field(
+        default=False, 
+        metadata={"help": "Whether to use bf16 (mixed) precision training instead of 32-bit training."}
+    )
+
 
 @dataclass
 class MyDataCollatorWithPadding:
@@ -601,6 +624,22 @@ class MyDataCollatorWithPadding:
 
 
 def main():
+    # 解析命令行参数
+    precision = "fp32"  # 默认值
+    print(sys.argv)
+    if '--precision' in sys.argv:
+        precision_index = sys.argv.index('--precision')
+        if precision_index + 1 < len(sys.argv):
+            precision = sys.argv[precision_index + 1]
+            # 删除 '--precision' 和其后面的值
+            del sys.argv[precision_index:precision_index + 2]
+    for arg in sys.argv:
+        if arg.startswith("PRECISION="):
+            precision = arg.split("=")[1]
+            print(precision)
+            sys.argv.remove(arg)  # 从 sys.argv 中移除该参数
+    print(sys.argv)
+    # 继续使用 HfArgumentParser 解析其他参数
     parser = HfArgumentParser((ModelArguments, DynamicDataTrainingArguments, DynamicTrainingArguments))
     if len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
         # If we pass only one argument to the script and it's the path to a json file,
@@ -609,6 +648,17 @@ def main():
     else:
         model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
+    # 根据 precision 设置训练参数
+    if precision == "fp16":
+        training_args.fp16 = True
+        model_dtype = torch.float16
+    elif precision == "bf16":
+        training_args.bf16 = True
+        model_dtype = torch.bfloat16 
+    else:
+        model_dtype = torch.float32
+        
+    training_args.curve_path=f"curves/{data_args.tag}.jpg"
     if training_args.sweep:
         now = datetime.now()
         dt_str = now.strftime('%m_%d_%H_%M_%S')
@@ -808,6 +858,14 @@ def main():
                 finetuning_task=data_args.task_name,
                 cache_dir=model_args.cache_dir,
                 **config_kwargs)
+        elif 'qwen2' in model_args.model_name_or_path.lower():
+            config = Qwen2Config.from_pretrained(
+                model_args.config_name if model_args.config_name else model_args.model_name_or_path,
+                num_labels=num_labels,
+                finetuning_task=data_args.task_name,
+                cache_dir=model_args.cache_dir,
+                **config_kwargs
+            )
         else:
             config = OPTConfig.from_pretrained(
                 model_args.config_name if model_args.config_name else model_args.model_name_or_path,
@@ -845,6 +903,7 @@ def main():
         model_args.tokenizer_name if model_args.tokenizer_name else model_args.model_name_or_path,
         additional_special_tokens=special_tokens,
         cache_dir=model_args.cache_dir,
+        trust_remote_code=True
     )
     if "opt" in model_args.model_name_or_path:
         # Set SEP token
@@ -854,7 +913,11 @@ def main():
         tokenizer.sep_token_id = tokenizer.eos_token_id
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
+    if "Llama" in model_args.model_name_or_path:
+        tokenizer.sep_token_id = tokenizer.eos_token_id
+        tokenizer.pad_token_id = 0
 
+   
     if training_args.hf_inference_model:
         free_in_GB = int(torch.cuda.mem_get_info()[0]/1024**3)
         max_memory = f'{free_in_GB-5}GB'
@@ -865,8 +928,9 @@ def main():
             model_args.model_name_or_path,
             config=config,
             device_map='auto',
-            torch_dtype=torch.float16 if training_args.efficient_zero_order_fp16 else torch.float32,
+            torch_dtype=model_dtype,
             max_memory=max_memory,
+            trust_remote_code=True
         )
     else:
         model = model_fn.from_pretrained(
@@ -874,7 +938,13 @@ def main():
             from_tf=bool(".ckpt" in model_args.model_name_or_path),
             config=config,
             cache_dir=model_args.cache_dir,
+            torch_dtype=model_dtype,
+            trust_remote_code=True
         )
+
+    # 打印模型参数的数据类型
+    for name, param in model.named_parameters():
+        print(f"Parameter: {name}, dtype: {param.dtype}")
 
     if training_args.tie_emb:
         logger.warn("Tie embeddings. Only work for RoBERTa (in our code by default they are not tied)")
@@ -883,6 +953,8 @@ def main():
     if training_args.head_tuning:
         if model.config.model_type == "roberta":
             head_name = "lm_head"
+        elif model.config.model_type == "qwen2":
+            head_name = "lm_head"  # Qwen2的分类头名称
 
         for n, p in model.named_parameters():
             if head_name not in n:
@@ -927,8 +999,10 @@ def main():
         resize_token_type_embeddings(model, new_num_types=10, random_segment=model_args.random_segment)
 
     # Pass dataset and argument information to the model
-    if eval_dataset.label_word_list is not None:
+    if eval_dataset is not None and eval_dataset.label_word_list is not None:
         model.label_word_list = torch.tensor(eval_dataset.label_word_list).long().to(training_args.device)
+    else:
+        logger.warning("Eval dataset is None or does not have label_word_list.")
     if output_modes_mapping[data_args.task_name] == 'regression':
         # lower / upper bounds
         model.lb, model.ub = bound_mapping[data_args.task_name]
@@ -1040,7 +1114,7 @@ def main():
                 # model = model.to(training_args.device)
                 
                 # Now we just reload this from memory instead of disk <-- much faster
-                trainer.model.load_state_dict(trainer.best_model_ckpt)
+                trainer.model.load_state_dict(trainer.best_model_ckpt, strict=False)
 
     # Evaluation
     final_result = {
@@ -1072,6 +1146,8 @@ def main():
             eval_results.update(eval_result)
 
     test_results = {}
+    # 获取准确率
+    accuracy = 0
     if training_args.do_predict:
         logging.info("*** Test ***")
         test_datasets = [test_dataset]
@@ -1086,13 +1162,14 @@ def main():
             trainer.compute_metrics = build_compute_metrics_fn(test_dataset.args.task_name)
             output = trainer.evaluate(eval_dataset=test_dataset)
             test_result = output.metrics
-
+            accuracy = test_result.get("eval_acc", None)
             output_test_file = os.path.join(
                 training_args.output_dir, f"test_results_{test_dataset.args.task_name}.txt"
             )
             if trainer.is_world_process_zero():
                 with open(output_test_file, "w") as writer:
                     logger.info("***** Test results {} *****".format(test_dataset.args.task_name))
+                    
                     for key, value in test_result.items():
                         logger.info("  %s = %s", key, value)
                         writer.write("%s = %s\n" % (key, value))
@@ -1119,6 +1196,24 @@ def main():
 
     logger.info('****** Output Dir *******')
     logger.info(training_args.output_dir)
+
+   
+
+    model_name = os.path.basename( model_args.model_name_or_path)
+    if model_name.endswith('/'):
+        model_name = model_name[:-1]
+
+    print(data_args.tag)
+    print(model_name)
+    # 保存准确率到文件
+    if accuracy is not None:
+        output_dir = "result/{}/{}".format(data_args.tag, model_name)
+        os.makedirs(output_dir, exist_ok=True)
+        with open(os.path.join(output_dir, "accuracy.txt"), "w") as f:
+            f.write("Accuracy: {:.2f}\n".format(accuracy * 100))
+
+    logger.info(f"Data arguments: {data_args}")
+    logger.info(f"Model arguments: {model_args}")
 
     return eval_results
 

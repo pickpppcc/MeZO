@@ -26,6 +26,10 @@ if [ "$BF" == "fp16" ]; then
     BF_ARGS="--load_float16"
 fi
 
+if [ "$BF" == "bf16" ]; then
+    BF_ARGS="--load_bfloat16"
+fi
+
 TAG=mezo-$MODE-$STEPS-$BS-$LR-$EPS-$SEED-$BF
 
 TASK_ARGS=""

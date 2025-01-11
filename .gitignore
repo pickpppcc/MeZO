@@ -161,3 +161,4 @@ llm_eval/data
 *.pdf
 
 large_models/curves/
+medium_models/curves/

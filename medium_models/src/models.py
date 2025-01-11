@@ -5,10 +5,15 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers.models.bert.modeling_bert import BertPreTrainedModel, BertModel, BertOnlyMLMHead
+
 # from transformers.models.roberta.modeling_roberta import  RobertaPreTrainedModel, RobertaModel, RobertaLMHead
 from .modeling_roberta import RobertaPreTrainedModel, RobertaModel, RobertaLMHead
+from transformers.models.llama.modeling_llama import LlamaPreTrainedModel, LlamaModel, LlamaForCausalLM
 # from transformers.models.opt.modeling_opt import OPTPreTrainedModel, OPTModel, OPTDecoder
 from .modeling_opt import OPTPreTrainedModel, OPTModel, OPTDecoder, OPTForCausalLM
+from transformers.modeling_utils import PreTrainedModel
+from transformers.models.llama.configuration_llama import LlamaConfig
+from transformers.modeling_utils import PreTrainedModel
 from transformers.models.gpt2.modeling_gpt2 import GPT2PreTrainedModel, GPT2Model, GPT2LMHeadModel
 from transformers.modeling_outputs import BaseModelOutputWithPast
 from typing import Callable, Dict, Optional, Union, List, Tuple
@@ -18,6 +23,12 @@ import random
 import logging
 logger = logging.getLogger(__name__)
 
+# 添加 Qwen2 相关导入
+from transformers.models.qwen2.modeling_qwen2 import (
+    Qwen2PreTrainedModel,
+    Qwen2Model,
+    Qwen2ForCausalLM
+)
 
 def resize_token_type_embeddings(model, new_num_types: int, random_segment: bool):
     """
@@ -279,6 +290,45 @@ class GPT2ModelForPromptFinetuning(GPT2LMHeadModel):
     def forward(self, input_ids=None, attention_mask=None, token_type_ids=None, mask_pos=None, labels=None):
         return model_for_prompting_forward(self, input_ids, attention_mask, token_type_ids, mask_pos, labels)
 
+class LlamaModelForPromptFinetuning(LlamaPreTrainedModel):
+    def __init__(self, config):
+        super().__init__(config)
+        # raise NotImplementedError("Need to check if the lm head is properly loaded and whether it is tied.")
+        self.num_labels = config.num_labels
+        print(config)
+        self.model_type = config.model_type
+
+        # 初始化 LLaMA 基础模型
+        self.llama = LlamaModel(config)
+
+        # Masked Language Model (MLM) 头
+        self.cls = nn.Linear(config.hidden_size, config.vocab_size)
+
+        # 分类器头（如果需要分类任务）
+        self.classifier = nn.Linear(config.hidden_size, self.num_labels)
+
+        # 初始化权重
+        self.init_weights()
+
+        # 用于初始化时的额外属性
+        self.model_args, self.data_args, self.label_word_list = None, None, None
+
+        # 回归任务的上下界
+        self.lb, self.ub = 0.0, 1.0
+
+        # 返回完整 softmax 分布
+        self.return_full_softmax = None
+
+    def get_model_fn(self):
+        return self.llama
+
+    def get_lm_head_fn(self):
+        return self.cls
+    
+    def forward(self, input_ids=None, attention_mask=None, token_type_ids=None, mask_pos=None, labels=None):
+        return model_for_prompting_forward(self, input_ids, attention_mask, token_type_ids, mask_pos, labels)
+
+
 class EfficientOPTDecoder(OPTDecoder):
     def __init__(self, config, num_exclude):
         super().__init__(config)
@@ -474,9 +524,58 @@ class EfficientOPTDecoder(OPTDecoder):
         )
 
 
+class Qwen2ModelForPromptFinetuning(Qwen2PreTrainedModel):
+    def __init__(self, config):
+        super().__init__(config)
+        self.num_labels = config.num_labels
+        print(config)
+        self.model_type = config.model_type
+        
+        # 初始化 Qwen2 基础模型
+        self.model = Qwen2Model(config)
+        
+        # 语言模型头部
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        
+        # 分类器头部
+        self.classifier = nn.Linear(config.hidden_size, self.num_labels)
+        
+        # 初始化权重
+        self.init_weights()
+        
+        # 用于初始化时的额外属性
+        self.model_args, self.data_args, self.label_word_list = None, None, None
+        
+        # 回归任务的上下界
+        self.lb, self.ub = 0.0, 1.0
+        
+        # 返回完整 softmax 分布
+        self.return_full_softmax = None
+
+    def get_model_fn(self):
+        return self.model
+
+    def get_lm_head_fn(self):
+        return self.lm_head
+
+    def forward(self, input_ids=None, attention_mask=None, token_type_ids=None, mask_pos=None, labels=None, sfc_input_ids=None, sfc_attention_mask=None, sfc_mask_pos=None):
+        return model_for_prompting_forward(
+            self, 
+            input_ids, 
+            attention_mask, 
+            token_type_ids, 
+            mask_pos, 
+            labels, 
+            sfc_input_ids=sfc_input_ids, 
+            sfc_attention_mask=sfc_attention_mask, 
+            sfc_mask_pos=sfc_mask_pos
+        )
+
 MODEL_TYPES = {
     "bert": BertModelForPromptFinetuning,
     "roberta": RobertaModelForPromptFinetuning,
     "opt": OPTModelForPromptFinetuning,
     "gpt2": GPT2ModelForPromptFinetuning,
+    "llama": LlamaModelForPromptFinetuning,
+    "qwen2": Qwen2ModelForPromptFinetuning  # 添加 Qwen2 模型
 }

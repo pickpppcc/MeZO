@@ -4,13 +4,16 @@
 TASK=${TASK:-"SST-2"}           # see all the options in the "cases" below
 SEED=${SEED:-13}                # random seed and also data seed, by default the data split seeds are {13, 21, 42, 87, 100}
 K=${K:-16}                      # choose from {16, 64, 512} by default
-MODEL=${MODEL:-"roberta-large"}  # pick a RoBERTa or BERT model
+MODEL=${MODEL:-roberta-large}
+MODEL_NAME=(${MODEL//\// })
+MODEL_NAME="${MODEL_NAME[-1]}"
 TYPE=${TYPE:-"prompt"}          # fine-tuning setting, choose from "finetune" and "prompt"
 TRAINER=${TRAINER:-"standard"}  # choose from "standard" and "linearhead"
 TAG=${TAG:-}                    # set a tag to distinguish and aggregate runs in the log
 NUM_GPU=${NUM_GPU:-1}           # by default use 1 GPU, set to 0 for CPU-only training
 OPT=${OPT:-"adam"}
 STEPS=${STEPS:-1000}
+PRECISION=${PRECISION:-"fp32"}  # default value is fp32
 
 TASK_EXTRA=""
 case $TASK in
@@ -81,11 +84,20 @@ case $TASK in
         ;;
 esac
 
+# Set precision arguments based on the PRECISION parameter
+if [ "$PRECISION" == "fp16" ]; then
+    PRECISION_ARGS="--precision fp16 --fp16"
+elif [ "$PRECISION" == "bf16" ]; then
+    PRECISION_ARGS="--precision bf16 --bf16"
+else
+    PRECISION_ARGS="--precision fp32"
+fi
+
 ALL_ARGS_TOGETHER="
     --model_name_or_path $MODEL --few_shot_type $TYPE
     --task_name $TASK --template $TEMPLATE --mapping $MAPPING
     --data_dir data/k-shot-1k-test/$TASK/$K-$SEED
-    --overwrite_output_dir --output_dir result/$TASK-$MODEL-$TYPE-$TRAINER-$TAG$GRID_TAG/$K-$SEED
+    --overwrite_output_dir --output_dir result/$TASK-$MODEL_NAME-$TYPE-$TRAINER-$TAG$GRID_TAG/$K-$SEED
     --num_k $K
     --tag $TAG
     --max_seq_length 128
@@ -96,6 +108,10 @@ ALL_ARGS_TOGETHER="
     --logging_steps 10
     --per_device_eval_batch_size 4
     --evaluate_during_training
+    $PRECISION_ARGS
+    --zero_order_clip_grad
+    --max_grad_norm 1.0
+    --zero_order_use_trainer_optim
     $TASK_EXTRA
     $LOAD_KERNELS
     $@
@@ -109,11 +125,11 @@ if [[ $NUM_GPU > 1 ]]; then
     # Allow multiple threads
     export OMP_NUM_THREADS=8
 
-    python -m torch.distributed.launch --nproc_per_node $NUM_GPU --master_port $PORT_ID run.py \
+    python -m torch.distributed.launch --nproc_per_node 2 --master_port $PORT_ID run.py \
         $ALL_ARGS_TOGETHER
 else
     python run.py \
         $ALL_ARGS_TOGETHER
 fi
 
-rm -rf result/$TASK-$MODEL-$TYPE-$TRAINER-$TAG$GRID_TAG/$K-$SEED
+rm -rf result/$TASK-$MODEL_NAME-$TYPE-$TRAINER-$TAG$GRID_TAG/$K-$SEED

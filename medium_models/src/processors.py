@@ -466,11 +466,25 @@ class TextClassificationProcessor(DataProcessor):
 
     def get_train_examples(self, data_dir):
         """See base class."""
-        return self._create_examples(pd.read_csv(os.path.join(data_dir, "train.csv"), header=None).values.tolist(), "train")
+        train_file = os.path.join(data_dir, "train.csv")
+        logger.info(f"Checking train file at {train_file}")
+        if os.path.exists(train_file) and os.path.getsize(train_file) > 0:
+            logger.info(f"Train file {train_file} found with size {os.path.getsize(train_file)} bytes.")
+            return self._create_examples(pd.read_csv(train_file, header=None).values.tolist(), "train")
+        else:
+            logger.warning(f"Train file {train_file} is empty or does not exist.")
+            return []  # 返回空列表以处理空文件情况
 
     def get_dev_examples(self, data_dir):
         """See base class."""
-        return self._create_examples(pd.read_csv(os.path.join(data_dir, "dev.csv"), header=None).values.tolist(), "dev")
+        dev_file = os.path.join(data_dir, "dev.csv")
+        logger.info(f"Checking dev file at {dev_file}")
+        if os.path.exists(dev_file) and os.path.getsize(dev_file) > 0:
+            logger.info(f"Dev file {dev_file} found with size {os.path.getsize(dev_file)} bytes.")
+            return self._create_examples(pd.read_csv(dev_file, header=None).values.tolist(), "dev")
+        else:
+            logger.warning(f"Dev file {dev_file} is empty or does not exist.")
+            return []  # 返回空列表以处理空文件情况
 
     def get_test_examples(self, data_dir):
         """See base class."""

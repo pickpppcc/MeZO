@@ -27,6 +27,7 @@ import shutil
 import warnings
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+import matplotlib.pyplot as plt
 
 import numpy as np
 import torch
@@ -41,7 +42,7 @@ import math
 import time
 
 import transformers
-from transformers.file_utils import is_datasets_available, is_in_notebook, is_torch_tpu_available
+from transformers.utils import is_datasets_available, is_in_notebook, is_torch_tpu_available
 from transformers.integrations import (
     is_comet_available,
     is_optuna_available,
@@ -84,7 +85,7 @@ if is_in_notebook():
 
 # Check if Pytorch version >= 1.6 to switch between Native AMP and Apex
 if version.parse(torch.__version__) < version.parse("1.6"):
-    from transformers.file_utils import is_apex_available
+    from transformers.utils import is_apex_available
 
     if is_apex_available():
         from apex import amp
@@ -226,6 +227,7 @@ class Trainer(LinearHeadTrainer):
     def zo_forward(self, model: nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]]) -> torch.Tensor:
         model.eval()
         inputs = self._prepare_inputs(inputs)
+
         if self.args.optimize_acc:
             loss, logits = model(**inputs)
             preds = F.softmax(logits, dim=-1)
@@ -411,6 +413,10 @@ class Trainer(LinearHeadTrainer):
         self.objective = -float("inf")
         self.dev_objective = dev_objective if dev_objective is not None else default_dev_objective
 
+        self.loss_values = []
+        self.acc_values = []
+        self.step_values = []
+
         # Data loading.
         train_dataloader = self.get_train_dataloader()
         num_update_steps_per_epoch = len(train_dataloader) // self.args.gradient_accumulation_steps
@@ -447,12 +453,20 @@ class Trainer(LinearHeadTrainer):
             if not transformers.is_apex_available():
                 raise ImportError("Please install apex from https://www.github.com/nvidia/apex to use fp16 training.")
             model, optimizer = amp.initialize(model, optimizer, opt_level=self.args.fp16_opt_level)
+        elif self.args.bf16:
+            # 添加bf16支持
+            model = model.to(dtype=torch.bfloat16)
+            # # 确保某些模块(如LayerNorm)保持fp32精度
+            # for module in model.modules():
+            #     if isinstance(module, (nn.LayerNorm, nn.GroupNorm)):
+            #         module.to(dtype=torch.float32)
 
         # Multi-gpu training (should be after apex fp16 initialization)
         if self.args.n_gpu > 1:
             model = torch.nn.DataParallel(model)
-
-        # Distributed training (should be after apex fp16 initialization)
+           
+        # # Distributed training (should be after apex fp16 initialization)
+        self.args.local_rank = -1
         if self.args.local_rank != -1:
             model = torch.nn.parallel.DistributedDataParallel(
                 model,
@@ -670,8 +684,20 @@ class Trainer(LinearHeadTrainer):
                         ):
                             # Gradient norm clipping
                             if self.args.zero_order_clip_grad:
-                                norm = torch.nn.utils.clip_grad_norm_(model.parameters(), self.args.max_grad_norm)
-
+                                # norm = torch.nn.utils.clip_grad_norm_(model.parameters(), self.args.max_grad_norm)
+                                total_norm = 0.0
+                                for name, param in model.named_parameters():
+                                    if param.grad is not None:
+                                        param_norm = param.grad.data.norm(2)
+                                        total_norm += param_norm.item() ** 2
+                                total_norm = total_norm ** 0.5
+                                
+                                clip_coef = self.args.max_grad_norm / (total_norm + 1e-6)
+                                if clip_coef < 1:
+                                    for name, param in model.named_parameters():
+                                        if param.grad is not None:
+                                            param.grad.data.mul_(clip_coef)
+                            
                             # Update the parameters and step scheduler
                             optimizer.step()
                             scheduler.step()
@@ -688,7 +714,7 @@ class Trainer(LinearHeadTrainer):
                                         if p.grad is not None:
                                             norm += torch.sum(p.grad ** 2)
                                     norm = torch.sqrt(norm)
-                                logs["grad_norm"] = norm.item()
+                                    logs["grad_norm"] = norm.item()
                                 logs["learning_rate"] = (
                                     scheduler.get_last_lr()[0]
                                     if version.parse(torch.__version__) >= version.parse("1.4")
@@ -805,6 +831,9 @@ class Trainer(LinearHeadTrainer):
                 if self.args.evaluate_during_training and self.state.global_step % self.args.eval_steps == 0:
                     output = self.evaluate()
                     metrics = output.metrics
+                    self.step_values.append(self.state.global_step)
+                    self.loss_values.append(metrics['eval_loss'])
+                    self.acc_values.append(metrics['eval_acc'])
                     objective = self.dev_objective(metrics)
                     if objective > self.objective:
                         logger.info("Best dev result: {}".format(objective))
@@ -820,6 +849,11 @@ class Trainer(LinearHeadTrainer):
             if self.args.tpu_metrics_debug or self.args.debug:
                 # tpu-comment: Logging debug metrics for PyTorch/XLA (compile, execute times, ops, etc.)
                 xm.master_print(met.metrics_report())
+
+        if not (self.loss_values==[]):
+            self.plot_and_save_loss_curve()
+        if not (self.acc_values==[]):
+            self.plot_and_save_acc_curve()
 
         if self.args.past_index and hasattr(self, "_past"):
             # Clean the state at the end of training
@@ -854,7 +888,7 @@ class Trainer(LinearHeadTrainer):
             raise ValueError("eval_dataset must implement __len__")
 
         eval_dataloader = self.get_eval_dataloader(eval_dataset)
-
+      
         output = self.prediction_loop(eval_dataloader, description="Evaluation")
 
         self.log(output.metrics)
@@ -865,3 +899,55 @@ class Trainer(LinearHeadTrainer):
             xm.master_print(met.metrics_report())
 
         return output
+
+    def plot_and_save_loss_curve(self, save_path="convergence_curve.jpg"):
+        """
+        绘制并保存损失值的收敛曲线
+        :param losses: 损失值列表
+        :param save_path: 保存图片的路径
+        """
+        if save_path is not None:
+            save_path = self.args.curve_path.replace(".jpg", "-loss.jpg")
+        save_dir = os.path.dirname(save_path)
+        if save_dir != "" and not os.path.exists(save_dir):
+            os.makedirs(save_dir)
+
+
+        plt.figure(figsize=(10, 6))
+        loss=np.array(self.loss_values)
+        plt.plot(self.step_values, loss, label="Training Loss")
+        plt.title("Convergence Curve")
+        plt.xlabel("Step")
+        plt.ylabel("Loss")
+        plt.grid(True)
+        plt.legend()
+        
+        # 保存图像
+        plt.savefig(save_path)
+        print(f"Convergence curve saved to {save_path}")
+        plt.close()
+    
+    def plot_and_save_acc_curve(self, save_path="convergence_curve.jpg"):
+        """
+        绘制并保存损失值的收敛曲线
+        :param losses: 损失值列表
+        :param save_path: 保存图片的路径
+        """
+        if save_path is not None:
+            save_path = self.args.curve_path.replace(".jpg", "-acc.jpg")
+        save_dir = os.path.dirname(save_path)
+        if save_dir != "" and not os.path.exists(save_dir):
+            os.makedirs(save_dir)
+
+        plt.figure(figsize=(10, 6))
+        plt.plot(self.step_values, self.acc_values, label="Acc")
+        plt.title("Accuracy Curve")
+        plt.xlabel("Step")
+        plt.ylabel("Acc")
+        plt.grid(True)
+        plt.legend()
+        
+        # 保存图像
+        plt.savefig(save_path)
+        print(f"Convergence curve saved to {save_path}")
+        plt.close()
